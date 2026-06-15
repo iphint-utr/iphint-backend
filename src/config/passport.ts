@@ -114,7 +114,7 @@ passport.use(
         // if no subscription document exists yet, grant the initial 7-day Pro trial exactly once.
         const isOAuthOnlyAccount = !!user.googleId && !user.passwordHash;
         if (createdFromGoogle || isOAuthOnlyAccount) {
-          await ensureInitialTrialAccess(String(user._id));
+          // await ensureInitialTrialAccess(String(user._id));
         }
 
         if (!user.isActive) {

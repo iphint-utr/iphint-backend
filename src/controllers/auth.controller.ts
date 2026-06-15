@@ -60,11 +60,11 @@ const sendEmailVerificationLink = async (
     fromName: 'IPHINT',
     to: email,
     subject: 'Verify your email address',
-    text: `Hi ${name},\n\nPlease verify your email to activate your account and start your free trial:\n\n${verifyUrl}\n\nThis link expires in 24 hours.`,
+    text: `Hi ${name},\n\nPlease verify your email to activate your account:\n\n${verifyUrl}\n\nThis link expires in 24 hours.`,
     html: `
       <div style="font-family: Arial, sans-serif; color: #111; line-height: 1.5;">
         <h2 style="margin-bottom: 12px;">Verify your email</h2>
-        <p>Hi ${name}, please verify your email to activate your account and start your free trial.</p>
+        <p>Hi ${name}, please verify your email to activate your account.</p>
         <p>
           <a href="${verifyUrl}" style="display:inline-block;padding:10px 16px;background:#111;color:#fff;text-decoration:none;border-radius:8px;">
             Verify email
@@ -162,7 +162,7 @@ export class AuthController {
         success: true,
         referralApplied: validReferral,
         message:
-          'Registration successful. Please verify your email to activate your account and use your trial.',
+          'Registration successful. Please verify your email to activate your account.',
       });
     } catch (error) {
       next(error);
@@ -420,7 +420,7 @@ export class AuthController {
             await completeReferralEvent(String(legacyUser._id));
             await grantFreeMonthPremium(String(legacyUser._id));
           } else {
-            await grantLoginProAccess(String(legacyUser._id));
+            // await grantLoginProAccess(String(legacyUser._id));
           }
 
           legacyUser.emailVerified = true;
@@ -481,7 +481,7 @@ export class AuthController {
         await completeReferralEvent(String(newUser._id));
         await grantFreeMonthPremium(String(newUser._id));
       } else {
-        await grantLoginProAccess(String(newUser._id));
+        // await grantLoginProAccess(String(newUser._id));
       }
 
       await PendingRegistration.deleteOne({ _id: pending._id });
