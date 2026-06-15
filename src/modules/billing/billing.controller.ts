@@ -31,6 +31,9 @@ const paddleBase = (): string =>
 
 const isPaddlePriceId = (value: string) => /^pri_[a-z\d]{26}$/i.test(value.trim());
 
+// Export helpers for use in other modules (e.g., referral.controller for trial creation)
+export { isPaddlePriceId };
+
 const isPaddleNotFoundError = (err: any): boolean =>
   err?.response?.data?.error?.code === 'not_found';
 
@@ -328,6 +331,9 @@ const getOrCreatePaddleCustomer = async (
   await User.findByIdAndUpdate(userId, { paddleCustomerId });
   return paddleCustomerId;
 };
+
+// Export helpers for use in other modules (e.g., referral.controller for trial creation)
+export { paddleRequest, getOrCreatePaddleCustomer };
 
 // ─── Controllers ───────────────────────────────────────────────────────────
 
@@ -631,7 +637,9 @@ export const createPaddleCheckout = async (req: Request, res: Response) => {
 /**
  * PATCH /billing/subscription — upgrade or downgrade the active Paddle subscription.
  * Body: { tier: PlanTier, billingCycle?: BillingCycle }
- * Proration is applied immediately (industry standard).
+ * - For trial → paid upgrades: remaining trial days are added as bonus days (prorated immediately)
+ * - For paid → paid upgrades: proration applied immediately
+ * - For downgrades: scheduled for next billing period
  */
 export const updateSubscription = async (req: Request, res: Response) => {
   try {
@@ -671,6 +679,10 @@ export const updateSubscription = async (req: Request, res: Response) => {
       targetRank < currentRank ||
       (targetRank === currentRank && targetCycle !== currentCycle && currentCycle === 'annual' && targetCycle === 'monthly');
     const isUpgradeOrLateralNow = !isDowngradeRequest && !isKeepCurrentPlanRequest;
+
+    // Trial-specific logic: upgrade from trial → paid plan
+    const isTrialSubscription = (sub.status as string) === 'trialing' || (sub.grantSource as string) === 'trial';
+    const isUpgradeFromTrial = isTrialSubscription && isUpgradeOrLateralNow;
 
     if (!newPriceId) {
       return res.status(404).json({ success: false, message: `No Paddle price ID for plan "${tier}" (${targetCycle}).` });
@@ -767,11 +779,33 @@ export const updateSubscription = async (req: Request, res: Response) => {
       });
     }
 
+    // Calculate bonus days for trial upgrades
+    let bonusDays = 0;
+    if (isUpgradeFromTrial && sub.currentPeriodEnd) {
+      const now = new Date();
+      const remaining = sub.currentPeriodEnd.getTime() - now.getTime();
+      bonusDays = Math.max(0, Math.ceil(remaining / (24 * 60 * 60 * 1000)));
+    }
+
     const prorationMode = isDowngradeRequest ? 'full_next_billing_period' : 'prorated_immediately';
-    const updatedSubscriptionResponse = await paddleRequest('patch', `/subscriptions/${paddleSubscriptionId}`, {
+    
+    // For trial upgrades, extend the billing period by remaining trial days
+    const patchPayload: Record<string, unknown> = {
       items: nextItems,
       proration_billing_mode: prorationMode,
-    });
+    };
+
+    if (isUpgradeFromTrial && bonusDays > 0) {
+      // Add bonus days by extending the first billing period
+      const existingPaddleSub = currentSubscriptionResponse?.data;
+      const currentPeriodEnd = existingPaddleSub?.current_billing_period?.ends_at
+        ? new Date(existingPaddleSub.current_billing_period.ends_at)
+        : new Date();
+      const extendedEnd = new Date(currentPeriodEnd.getTime() + bonusDays * 24 * 60 * 60 * 1000);
+      patchPayload.next_billed_at = extendedEnd.toISOString();
+    }
+
+    const updatedSubscriptionResponse = await paddleRequest('patch', `/subscriptions/${paddleSubscriptionId}`, patchPayload);
 
     if (isDowngradeRequest) {
       const existingPaddleSub = currentSubscriptionResponse?.data;
@@ -786,7 +820,15 @@ export const updateSubscription = async (req: Request, res: Response) => {
         },
       });
     } else if (isUpgradeOrLateralNow) {
+      // Update local subscription with bonus days information
+      const bonusSearches = bonusDays > 0 ? Math.round((bonusDays / 30) * def.imageUploadLimit) : 0;
+      const bonusAlerts = bonusDays > 0 ? Math.round((bonusDays / 30) * def.alertLimit) : 0;
+
       await Subscription.findByIdAndUpdate(sub._id, {
+        $set: {
+          bonusSearches: (sub.bonusSearches ?? 0) + bonusSearches,
+          bonusAlerts: (sub.bonusAlerts ?? 0) + bonusAlerts,
+        },
         $unset: {
           pendingPlanTier: '',
           pendingBillingCycle: '',
@@ -813,6 +855,8 @@ export const updateSubscription = async (req: Request, res: Response) => {
       syncedLocally,
       message: isDowngradeRequest
         ? `Downgrade to ${def.name} (${targetCycle}) is scheduled for your next renewal.`
+        : isUpgradeFromTrial
+        ? `Upgraded to ${def.name} (${targetCycle})${bonusDays > 0 ? ` with ${bonusDays} bonus days` : ''}. Changes take effect immediately.`
         : `Subscription change to ${def.name} (${targetCycle}) submitted. Changes take effect immediately.`,
     });
   } catch (err: any) {
@@ -1268,6 +1312,49 @@ export const syncSubscriptionFromPaddle = async (req: Request, res: Response) =>
     console.error('[Paddle Sync Error]', JSON.stringify(paddleError ?? err?.message, null, 2));
     const msg = paddleError?.error?.detail || err?.message || 'Server error';
     res.status(500).json({ success: false, message: msg });
+  }
+};
+
+/**
+ * POST /billing/start-trial — initiate a 7-day trial for the user
+ * Request body: { tier?: 'pro' | 'premium' | 'starter' } (defaults to 'pro')
+ */
+export const startTrial = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id as string;
+    const { tier = 'pro' } = req.body as { tier?: PlanTier };
+
+    // Import grantPlanForDays dynamically to avoid circular dependency at require-time
+    // This is safe because it's called at runtime, not module init
+    const { grantPlanForDays } = await import('../referral/referral.controller');
+
+    // Check if user already has an active or trialing subscription
+    const existing = await Subscription.findOne({
+      userId,
+      status: { $in: ['active', 'trialing', 'pending'] },
+    }).lean();
+
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: existing.status === 'trialing'
+          ? 'You already have an active trial. Upgrade to a paid plan or wait for it to expire.'
+          : `You already have an active ${existing.status} subscription.`,
+      });
+    }
+
+    // Grant the trial via the referral controller
+    await grantPlanForDays(userId, tier, Number(process.env.TRIAL_DAYS_PRO ?? 7), 'trial', '[Start Trial Modal]');
+
+    res.json({
+      success: true,
+      message: `7-day ${tier.charAt(0).toUpperCase() + tier.slice(1)} trial started!`,
+      tier,
+    });
+  } catch (error: any) {
+    console.error('[Start Trial Error]', error?.message);
+    const msg = error?.message || 'Failed to start trial. Please try again.';
+    res.status(error?.statusCode ?? 500).json({ success: false, message: msg });
   }
 };
 

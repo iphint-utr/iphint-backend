@@ -5,6 +5,7 @@ import { Subscription } from '../../models/subscriptions';
 import { Plan } from '../../models/plan';
 import { Reward } from '../../models/rewards';
 import { getPlanDefinition } from '../billing/billing.constants';
+import { paddleRequest, getOrCreatePaddleCustomer, isPaddlePriceId } from '../billing/billing.controller';
 import type { PlanTier } from '../../models/plan';
 import { topUpCredits, topUpAlerts } from '../../common/helpers/alert.helper';
 
@@ -164,6 +165,47 @@ const grantPlanForDays = async (
     const now = new Date();
     const periodEnd = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
 
+    // For trials, create a Paddle subscription via the Paddle API
+    let paddleSubscriptionId: string | undefined;
+    let paddleCustomerId: string | undefined;
+
+    if (grantSource === 'trial') {
+      try {
+        const user = await User.findById(userId).select('email name paddleCustomerId').lean();
+        const email: string = (user as any)?.email ?? '';
+        const name: string = (user as any)?.name ?? '';
+
+        // Get or create Paddle customer
+        paddleCustomerId = await getOrCreatePaddleCustomer(userId, email, name);
+
+        // Determine which trial price to use
+        const trialPriceId = planDef.paddleTrialPriceId;
+        if (trialPriceId && isPaddlePriceId(String(trialPriceId))) {
+          try {
+            // Create Paddle subscription using trial price
+            const createSubResponse = await paddleRequest('post', '/subscriptions', {
+              customer_id: paddleCustomerId,
+              items: [{ price_id: trialPriceId, quantity: 1 }],
+              custom_data: { userId },
+            });
+
+            paddleSubscriptionId = createSubResponse?.data?.id;
+            if (!paddleSubscriptionId) {
+              console.warn(`[Trial Grant] Paddle subscription creation returned no ID for userId=${userId}`);
+            }
+          } catch (paddleCreateErr: any) {
+            console.error(`[Trial Grant] Failed to create Paddle subscription: ${logPrefix}`, paddleCreateErr?.response?.data ?? paddleCreateErr?.message);
+            // Fall through to create local trial subscription if Paddle fails
+          }
+        } else {
+          console.warn(`[Trial Grant] No trial price ID configured for tier ${tier}`, { trialPriceId });
+        }
+      } catch (paddleErr: any) {
+        console.error(`[Trial Grant] Failed to setup Paddle trial: ${logPrefix}`, paddleErr?.message);
+        // Fall through to create local trial subscription if Paddle fails
+      }
+    }
+
     await Subscription.create({
       userId,
       planId:           plan._id,
@@ -173,6 +215,8 @@ const grantPlanForDays = async (
       currentPeriodEnd: periodEnd,
       nextBillingDate:  periodEnd,
       status:           grantSource === 'trial' ? 'trialing' : 'active',
+      ...(paddleSubscriptionId ? { paddleSubscriptionId } : {}),
+      ...(paddleCustomerId ? { paddleCustomerId } : {}),
       ...(grantSource === 'trial' ? { trialReminderStages: [] } : {}),
       ...(grantSource === 'trial' ? { trialEndDate: periodEnd } : {}),
     });

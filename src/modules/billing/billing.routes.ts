@@ -14,6 +14,7 @@ import {
   getBillingPortalUrl,
   getBillingHistory,
   syncSubscriptionFromPaddle,
+  startTrial,
 } from './billing.controller';
 
 const router = Router();
@@ -41,6 +42,9 @@ router.get('/history',           authMiddleware, getBillingHistory);
 
 // Paddle checkout — initiates a real (or trial) payment session
 router.post('/paddle/checkout',  authMiddleware, createPaddleCheckout);
+
+// Start trial — initiate 7-day free trial from modal
+router.post('/start-trial',      authMiddleware, startTrial);
 
 // Sync subscription state from Paddle API (use after checkout when webhook hasn't fired)
 router.post('/sync',             authMiddleware, syncSubscriptionFromPaddle);
