@@ -1324,10 +1324,6 @@ export const startTrial = async (req: Request, res: Response) => {
     const userId = req.user?.id as string;
     const { tier = 'pro' } = req.body as { tier?: PlanTier };
 
-    // Import grantPlanForDays dynamically to avoid circular dependency at require-time
-    // This is safe because it's called at runtime, not module init
-    const { grantPlanForDays } = await import('../referral/referral.controller');
-
     // Check if user already has an active or trialing subscription
     const existing = await Subscription.findOne({
       userId,
@@ -1343,13 +1339,96 @@ export const startTrial = async (req: Request, res: Response) => {
       });
     }
 
-    // Grant the trial via the referral controller
-    await grantPlanForDays(userId, tier, Number(process.env.TRIAL_DAYS_PRO ?? 7), 'trial', '[Start Trial Modal]');
+    // Get plan definition
+    const planDef = getPlanDefinition(tier);
+    const trialDays = planDef.trialDays ?? Number(process.env.TRIAL_DAYS_PRO ?? 7);
+
+    // Get or create plan in DB
+    const plan = await Plan.findOneAndUpdate(
+      { tier },
+      {
+        $set: {
+          name:              planDef.name,
+          imageUploadLimit:  planDef.imageUploadLimit,
+          alertLimit:        planDef.alertLimit,
+          pdfEnabled:        planDef.pdfEnabled,
+          weeklyEmailAlerts: planDef.weeklyEmailAlerts,
+          monthlyPrice:      planDef.pricing.monthly,
+          annualPrice:       planDef.pricing.annual,
+          trialDays:         planDef.trialDays,
+        },
+        $setOnInsert: { tier },
+      },
+      { upsert: true, new: true },
+    );
+
+    // Cancel any existing subscriptions
+    await Subscription.updateMany(
+      { userId, status: { $in: ['active', 'pending'] } },
+      { $set: { status: 'cancelled', cancelDate: new Date() } },
+    );
+
+    const now = new Date();
+    const periodEnd = new Date(now.getTime() + trialDays * 24 * 60 * 60 * 1000);
+
+    // Try to create Paddle subscription if trial price ID exists
+    let paddleSubscriptionId: string | undefined;
+    let paddleCustomerId: string | undefined;
+
+    const trialPriceId = planDef.paddleTrialPriceId;
+    if (trialPriceId && isPaddlePriceId(String(trialPriceId))) {
+      try {
+        const user = await User.findById(userId).select('email name paddleCustomerId').lean();
+        const email: string = (user as any)?.email ?? '';
+        const name: string = (user as any)?.name ?? '';
+
+        // Get or create Paddle customer
+        paddleCustomerId = await getOrCreatePaddleCustomer(userId, email, name);
+
+        // Create Paddle subscription using trial price
+        const createSubResponse = await paddleRequest('post', '/subscriptions', {
+          customer_id: paddleCustomerId,
+          items: [{ price_id: trialPriceId, quantity: 1 }],
+          custom_data: { userId },
+        });
+
+        paddleSubscriptionId = createSubResponse?.data?.id;
+        if (!paddleSubscriptionId) {
+          console.warn(`[Start Trial] Paddle subscription creation returned no ID for userId=${userId}`);
+        }
+      } catch (paddleErr: any) {
+        console.error(`[Start Trial] Failed to create Paddle subscription: ${paddleErr?.message}`);
+        // Fall back to local trial if Paddle fails
+      }
+    }
+
+    // Create local subscription
+    await Subscription.create({
+      userId,
+      planId:           plan._id,
+      billingCycle:     'monthly',
+      grantSource:      'trial',
+      activationDate:   now,
+      currentPeriodEnd: periodEnd,
+      nextBillingDate:  periodEnd,
+      status:           'trialing',
+      trialEndDate:     periodEnd,
+      trialReminderStages: [],
+      ...(paddleSubscriptionId ? { paddleSubscriptionId } : {}),
+      ...(paddleCustomerId ? { paddleCustomerId } : {}),
+    });
+
+    // Top up credits and alerts
+    await Promise.all([
+      topUpCredits(userId, planDef.imageUploadLimit),
+      topUpAlerts(userId, planDef.alertLimit),
+    ]);
 
     res.json({
       success: true,
       message: `7-day ${tier.charAt(0).toUpperCase() + tier.slice(1)} trial started!`,
       tier,
+      trialDays,
     });
   } catch (error: any) {
     console.error('[Start Trial Error]', error?.message);
