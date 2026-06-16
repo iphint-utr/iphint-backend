@@ -236,6 +236,7 @@ export class AuthController {
           credits: user.credits,
           referralCode: user.referralCode,
           referralCount: user.referralCount,
+          isReferred: !!user.refferedBy,
         },
       });
     } catch (error) {
@@ -251,7 +252,7 @@ export class AuthController {
       }
 
       const user = await User.findById(userId).select(
-        '_id name email role credits referralCode referralCount isActive',
+        '_id name email role credits referralCode referralCount isActive refferedBy',
       );
 
       if (!user) {
@@ -272,6 +273,7 @@ export class AuthController {
           credits: user.credits,
           referralCode: user.referralCode,
           referralCount: user.referralCount,
+          isReferred: !!user.refferedBy,
           emailVerified: user.emailVerified !== false,
         },
       });
@@ -418,7 +420,7 @@ export class AuthController {
               { upsert: true },
             );
             await completeReferralEvent(String(legacyUser._id));
-            await grantFreeMonthPremium(String(legacyUser._id));
+            // await grantFreeMonthPremium(String(legacyUser._id));
           } else {
             // await grantLoginProAccess(String(legacyUser._id));
           }
@@ -479,7 +481,7 @@ export class AuthController {
           { upsert: true },
         );
         await completeReferralEvent(String(newUser._id));
-        await grantFreeMonthPremium(String(newUser._id));
+        // await grantFreeMonthPremium(String(newUser._id));
       } else {
         // await grantLoginProAccess(String(newUser._id));
       }

@@ -1341,7 +1341,7 @@ export const startTrial = async (req: Request, res: Response) => {
 
     // Get plan definition
     const planDef = getPlanDefinition(tier);
-    const trialDays = planDef.trialDays ?? Number(process.env.TRIAL_DAYS_PRO ?? 7);
+    const userDoc = await User.findById(userId).select(\'refferedBy\').lean();\n    const isReferred = !!(userDoc as any)?.refferedBy;\n    const trialDays = isReferred ? 30 : (planDef.trialDays ?? Number(process.env.TRIAL_DAYS_PRO ?? 7));
 
     // Get or create plan in DB
     const plan = await Plan.findOneAndUpdate(
